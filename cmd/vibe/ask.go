@@ -8,11 +8,14 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/alexflint/go-arg"
 	"github.com/atotto/clipboard"
 	"github.com/pkoukk/tiktoken-go"
+
+	"github.com/hayeah/fork2/ignore"
 )
 
 // AskCmd contains the arguments for the 'ask' subcommand
@@ -160,35 +163,125 @@ func (r *AskRunner) Run() error {
 	return nil
 }
 
-// filterFiles handles the file selection phase, either automatically or interactively
+// filterFiles handles the file selection phase, either automatically or interactively.
+// It respects .gitignore by default, but adds back ignored files if they are
+// explicitly matched by a --select pattern.
 func (r *AskRunner) filterFiles() ([]string, error) {
 	var selectedFiles []string
 	var err error
 
 	if r.Args.All {
-		// Select all files
+		// Select all non-ignored files
+		// TODO: Clarify if --all should bypass gitignore. Assuming it respects gitignore for now.
 		selectedFiles = r.DirTree.SelectAllFiles()
 	} else if len(r.Args.Select) > 0 {
-		// Stepwise narrowing using multiple patterns, with support for negative patterns
+		// Step 1: Get files matching patterns from the initial tree (respects gitignore)
 		selectedFiles, err = r.DirTree.SelectByPatterns(r.Args.Select)
 		if err != nil {
 			return nil, fmt.Errorf("error selecting files with patterns %v: %w", r.Args.Select, err)
 		}
+
+		// Step 2: Add back any ignored files that were explicitly selected
+		// by walking the entire directory structure and adding matches to the DirTree.
+		// selectedSet := NewSetFromSlice(selectedFiles) // No longer needed
+		ig, err := ignore.NewIgnore(r.RootPath)
+		if err != nil {
+			// If gitignore fails to load, log it but proceed without adding back ignored files
+			log.Printf("Warning: could not load gitignore rules from %s: %v", r.RootPath, err)
+		} else {
+			err = filepath.WalkDir(r.RootPath, func(path string, d os.DirEntry, walkErr error) error {
+				if walkErr != nil {
+					if os.IsPermission(walkErr) {
+						return nil // Skip permission errors
+					}
+					return walkErr
+				}
+
+				if d.IsDir() {
+					// Skip .git directory
+					if d.Name() == ".git" && path != r.RootPath { // Ensure we don't skip root if it's named .git (edge case)
+						return filepath.SkipDir
+					}
+					// Check if directory itself is ignored; if so, skip it
+					// unless specific files within it are requested by --select
+					isDirIgnored, _ := ig.IsIgnored(path, true)
+					if isDirIgnored && path != r.RootPath { // don't skip root
+						// If select patterns are provided, we need to check files inside,
+						// so don't skip the directory here.
+						if len(r.Args.Select) == 0 {
+							return filepath.SkipDir
+						}
+						// Otherwise (if select patterns ARE provided), continue into the dir.
+					}
+					return nil // Continue walking directory
+				}
+
+				// It's a file, check if it was ignored
+				isFileIgnored, _ := ig.IsIgnored(path, false)
+				if isFileIgnored {
+					// Check if this ignored file matches any of the user's --select patterns
+					matches, matchErr := matchesAnyPattern(path, r.Args.Select)
+					if matchErr != nil {
+						// Log pattern errors but continue walking
+						log.Printf("Warning: error checking pattern for ignored file %s: %v", path, matchErr)
+					} else if matches {
+						// Add the explicitly selected, previously ignored file back to the DirTree
+						if addErr := r.DirTree.AddFilteredSelectedFile(path); addErr != nil {
+							log.Printf("Warning: failed to add selected ignored file %s back to tree: %v", path, addErr)
+						}
+						// selectedSet.Add(path) // No longer needed
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				// Log walking errors but proceed with the files found so far
+				log.Printf("Warning: error walking directory to check ignored files: %v", err)
+			}
+		}
+		// selectedFiles = selectedSet.Values() // No longer needed
+		// Re-run SelectByPatterns on the potentially updated DirTree
+		selectedFiles, err = r.DirTree.SelectByPatterns(r.Args.Select)
+		if err != nil {
+			// This error should ideally not happen if the patterns were valid before,
+			// but handle it just in case.
+			return nil, fmt.Errorf("error re-selecting files after adding ignored ones: %w", err)
+		}
+
+		// Re-sort after potentially adding ignored files and re-selecting
+		sort.Strings(selectedFiles)
+
+	} else {
+		// Interactive selection (assuming this part is commented out or handled elsewhere)
+		// If interactive selection is enabled, it might need similar logic
+		// to potentially show/select ignored files if desired.
+		// For now, returning empty list if no patterns and not --all.
+		selectedFiles = []string{}
 	}
-	// else {
-	// 	// Interactive selection
-	// 	selectedFiles, _, err = selectFilesInteractively(r.DirTree, r.TokenEstimator)
-	// 	if err != nil {
-	// 		return nil, err
-	// 	}
-	// 	if selectedFiles == nil {
-	// 		return nil, nil
-	// 	}
-	// }
-	if err != nil {
-		return nil, err
-	}
+
 	return selectedFiles, nil
+}
+
+// matchesAnyPattern checks if a given path matches any of the provided selection patterns.
+// Uses the same logic as selectSinglePattern (fuzzy or regex based on prefix).
+// NOTE: This helper function needs access to selectSinglePattern or its logic.
+// Since selectSinglePattern is in the 'main' package (directory_tree.go), we can call it.
+func matchesAnyPattern(path string, patterns []string) (bool, error) {
+	for _, pattern := range patterns {
+		// We simulate calling selectSinglePattern with a single path and one pattern.
+		// selectSinglePattern filters a list; here we just check if our single path would survive.
+		matches, err := selectSinglePattern([]string{path}, pattern)
+		if err != nil {
+			// Handle error potentially caused by an invalid pattern
+			return false, fmt.Errorf("pattern '%s': %w", pattern, err)
+		}
+		// If the result contains our path, it's a match for this pattern.
+		if len(matches) > 0 && matches[0] == path {
+			return true, nil
+		}
+	}
+	// Path did not match any of the patterns
+	return false, nil
 }
 
 // calculateTokenCount calculates the total token count for a list of file paths

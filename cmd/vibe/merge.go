@@ -15,6 +15,7 @@ import (
 type MergeCmd struct {
 	Paste bool `arg:"--paste" help:"Read input from clipboard"`
 	Dry   bool `arg:"--dry" help:"Dry run (verification only)"`
+	File  string `arg:"positional" help:"Input file path"`
 }
 
 // MergeRunner encapsulates the state and behavior for the merge command
@@ -73,15 +74,25 @@ func (r *MergeRunner) readHeredocContent() (string, error) {
 		if content == "" {
 			return "", fmt.Errorf("clipboard is empty")
 		}
+	} else if r.Args.File != "" {
+		// Read from the specified file if provided
+		bytes, err := os.ReadFile(r.Args.File)
+		if err != nil {
+			return "", fmt.Errorf("failed to read file %s: %w", r.Args.File, err)
+		}
+		content = string(bytes)
+		if content == "" {
+			return "", fmt.Errorf("file %s is empty", r.Args.File)
+		}
 	} else {
-		// Read from stdin if no --paste flag
+		// Otherwise, read from stdin
 		bytes, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return "", fmt.Errorf("failed to read from stdin: %w", err)
 		}
 		content = string(bytes)
 		if content == "" {
-			return "", fmt.Errorf("no input provided")
+			return "", fmt.Errorf("no input provided via file argument or stdin")
 		}
 	}
 

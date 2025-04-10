@@ -39,16 +39,21 @@ func gatherFiles(rootPath string) ([]item, map[string][]string, error) {
 	var items []item
 	childrenMap := make(map[string][]string)
 
+	// Restore ignore instance creation
 	ig, err := ignore.NewIgnore(rootPath)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// Use WalkDirGitIgnore to walk the directory tree while respecting gitignore
+	// Use WalkDir from the ignore package to walk the directory tree while respecting gitignore
 	err = ig.WalkDir(rootPath, func(path string, d os.DirEntry, isDir bool) error {
+		// The WalkDir function from ignore package already provides 'isDir'
+		// and handles errors internally based on gitignore logic (like skipping).
+		// It also skips .git automatically.
+
 		items = append(items, item{
 			Path:       path,
-			IsDir:      isDir,
+			IsDir:      isDir, // Use the provided isDir
 			TokenCount: 0,
 		})
 		return nil
@@ -77,6 +82,49 @@ func gatherFiles(rootPath string) ([]item, map[string][]string, error) {
 	}
 
 	return items, childrenMap, nil
+}
+
+// AddFilteredSelectedFile adds a file path to the directory tree items if it doesn't exist.
+// This is used to add back files that might have been filtered initially (e.g., by gitignore)
+// but were explicitly requested.
+func (dt *DirectoryTree) AddFilteredSelectedFile(path string) error {
+	// Check if the path already exists
+	for _, existingItem := range dt.Items {
+		if existingItem.Path == path {
+			return nil // Already present
+		}
+	}
+
+	// Get file info to determine if it's a directory
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Log or handle if the explicitly selected file doesn't actually exist
+			// For now, we just won't add it.
+			return nil
+		}
+		return fmt.Errorf("failed to stat path %s: %w", path, err)
+	}
+
+	// Create and add the new item
+	newItem := item{
+		Path:       path,
+		IsDir:      info.IsDir(),
+		TokenCount: 0, // Token count can be calculated later if needed
+	}
+	dt.Items = append(dt.Items, newItem)
+
+	// Note: We are not updating ChildrenMap here. Adding individual files
+	// doesn't typically require restructuring the parent-child relationships
+	// derived from the initial walk. If directories were added this way,
+	// the map might become inconsistent.
+
+	// Re-sort items to maintain order? Optional, depends on requirements.
+	// sort.Slice(dt.Items, func(i, j int) bool {
+	// 	return dt.Items[i].Path < dt.Items[j].Path
+	// })
+
+	return nil
 }
 
 // GenerateDirectoryTree writes a tree-like directory structure to w based on dt.
